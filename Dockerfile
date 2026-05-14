@@ -11,6 +11,8 @@ RUN npm install
 
 COPY . .
 
+RUN mkdir uploads converted
+
 EXPOSE 3000
 
 CMD ["node", "server.js"]
