@@ -27,11 +27,15 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
             });
         }
 
-        const inputPath = req.file.path;
+        const tempPath = req.file.path;
 
-        const originalName = req.file.originalname;
+        const inputPath =
+          tempPath + path.extname(req.file.originalname);
 
-        const ext = path.extname(originalName).toLowerCase();
+        fs.renameSync(tempPath, inputPath);
+
+        const ext =
+          path.extname(req.file.originalname).toLowerCase();
 
         let targetFormat = "pdf";
 
@@ -39,7 +43,8 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
             targetFormat = "docx";
         }
 
-        const outputDir = path.join(__dirname, "converted");
+        const outputDir =
+          path.join(__dirname, "converted");
 
         if (!fs.existsSync(outputDir)) {
             fs.mkdirSync(outputDir);
@@ -50,6 +55,9 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
 
         exec(command, (error, stdout, stderr) => {
 
+            console.log(stdout);
+            console.log(stderr);
+
             if (error) {
 
                 console.log(error);
@@ -59,7 +67,8 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
                 });
             }
 
-            const convertedFiles = fs.readdirSync(outputDir);
+            const convertedFiles =
+              fs.readdirSync(outputDir);
 
             if (!convertedFiles.length) {
 
