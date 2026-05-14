@@ -1,9 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const fs = require("fs");
 const path = require("path");
-const libre = require("libreoffice-convert");
+const fs = require("fs");
+const { exec } = require("child_process");
 
 const app = express();
 
@@ -29,36 +29,53 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
 
         const inputPath = req.file.path;
 
-        const ext = path.extname(req.file.originalname);
+        const originalName = req.file.originalname;
 
-        let outputExt = ".pdf";
+        const ext = path.extname(originalName).toLowerCase();
+
+        let targetFormat = "pdf";
 
         if (ext === ".pdf") {
-            outputExt = ".docx";
+            targetFormat = "docx";
         }
 
-        const file = fs.readFileSync(inputPath);
+        const outputDir = path.join(__dirname, "converted");
 
-        libre.convert(file, outputExt, undefined, (err, done) => {
+        if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir);
+        }
 
-            if (err) {
+        const command =
+          `libreoffice --headless --convert-to ${targetFormat} "${inputPath}" --outdir "${outputDir}"`;
 
-                console.log(err);
+        exec(command, (error, stdout, stderr) => {
+
+            if (error) {
+
+                console.log(error);
 
                 return res.status(500).json({
                     error: "Conversion failed"
                 });
             }
 
-            const outputFile = `converted${outputExt}`;
+            const convertedFiles = fs.readdirSync(outputDir);
 
-            fs.writeFileSync(outputFile, done);
+            if (!convertedFiles.length) {
 
-            res.download(outputFile, () => {
+                return res.status(500).json({
+                    error: "No converted file found"
+                });
+            }
+
+            const convertedPath =
+              path.join(outputDir, convertedFiles[0]);
+
+            res.download(convertedPath, () => {
 
                 fs.unlinkSync(inputPath);
 
-                fs.unlinkSync(outputFile);
+                fs.unlinkSync(convertedPath);
 
             });
 
