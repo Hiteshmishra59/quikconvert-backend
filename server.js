@@ -67,26 +67,29 @@ app.post("/api/convert", upload.single("file"), async (req, res) => {
                 });
             }
 
-            const convertedFiles =
-              fs.readdirSync(outputDir);
+           const originalBaseName =
+  path.parse(req.file.originalname).name;
 
-            if (!convertedFiles.length) {
+const convertedPath =
+  path.join(
+    outputDir,
+    `${originalBaseName}.${targetFormat}`
+  );
 
-                return res.status(500).json({
-                    error: "No converted file found"
-                });
-            }
+if (!fs.existsSync(convertedPath)) {
 
-            const convertedPath =
-              path.join(outputDir, convertedFiles[0]);
+    return res.status(500).json({
+        error: "No converted file found"
+    });
+}
 
-            res.download(convertedPath, () => {
+return res.download(convertedPath, () => {
 
-                fs.unlinkSync(inputPath);
+    fs.unlinkSync(inputPath);
 
-                fs.unlinkSync(convertedPath);
+    fs.unlinkSync(convertedPath);
 
-            });
+});
 
         });
 
