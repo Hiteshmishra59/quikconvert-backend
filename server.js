@@ -4,90 +4,113 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { exec } = require("child_process");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
 
-// Allow large uploads (100 MB)
 const upload = multer({
   dest: "uploads/",
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
-// Conversion map — targetExt is what LibreOffice outputs
+// targetExt = what we ask LibreOffice to produce
+// fallbackExts = other extensions LibreOffice might actually output
 const CONVERSIONS = {
-  "word-pdf":  { targetExt: "pdf",  args: "--convert-to pdf" },
-  "excel-pdf": { targetExt: "pdf",  args: '--convert-to pdf:"calc_pdf_Export:PageRange=,IsSkipEmptyPages=false"' },
-  "ppt-pdf":   { targetExt: "pdf",  args: "--convert-to pdf" },
-  "pdf-word":  { targetExt: "docx", args: '--convert-to docx:"Microsoft Word 2007-2019 XML (.docx)"' },
-  "pdf-excel": { targetExt: "xlsx", args: '--convert-to xlsx:"Calc MS Excel 2007 XML"' },
-  "pdf-ppt":   { targetExt: "pptx", args: '--convert-to pptx:"Impress MS PowerPoint 2007 XML"' },
+  "word-pdf":  { targetExt: "pdf",  args: '--convert-to pdf',                    fallbackExts: ["pdf"] },
+  "excel-pdf": { targetExt: "pdf",  args: '--convert-to pdf',                    fallbackExts: ["pdf"] },
+  "ppt-pdf":   { targetExt: "pdf",  args: '--convert-to pdf',                    fallbackExts: ["pdf"] },
+  "pdf-word":  { targetExt: "docx", args: '--convert-to docx',                   fallbackExts: ["docx","doc","odt"] },
+  "pdf-excel": { targetExt: "ods",  args: '--convert-to ods',                    fallbackExts: ["ods","xlsx","xls","csv"] },
+  "pdf-ppt":   { targetExt: "pptx", args: '--convert-to pptx',                   fallbackExts: ["pptx","ppt","odp"] },
 };
 
-// Possible output extensions LibreOffice might produce
-const FALLBACK_EXTS = {
-  "pdf":  ["pdf"],
-  "docx": ["docx", "doc", "odt"],
-  "xlsx": ["xlsx", "xls", "ods", "csv"],
-  "pptx": ["pptx", "ppt", "odp"],
-};
+// Env that prevents LibreOffice display/Java init errors in headless Docker
+const LO_ENV = Object.assign({}, process.env, {
+  HOME:               "/tmp",
+  SAL_USE_VCLPLUGIN:  "svp",
+  DISPLAY:            "",
+});
 
 app.get("/", (_req, res) => res.send("QuikConvert backend running ✓"));
 
 app.post("/api/convert", upload.single("file"), (req, res) => {
-  let inputPath = null;
+  let inputPath  = null;
+  let loUserDir  = null;
 
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const type = req.body.type || "";
-    const ext  = path.extname(req.file.originalname).toLowerCase();
+    const convKey = req.body.type || "word-pdf";
+    const conv    = CONVERSIONS[convKey];
+    if (!conv) return res.status(400).json({ error: `Unknown type: ${convKey}` });
 
-    const conversionKey = type || (ext === ".pdf" ? "pdf-word" : "word-pdf");
-    const conv = CONVERSIONS[conversionKey];
-    if (!conv) return res.status(400).json({ error: `Unknown conversion type: ${conversionKey}` });
-
-    // Rename temp file so LibreOffice can detect format from extension
-    inputPath = req.file.path + ext;
+    // Give LibreOffice the correct file extension so it auto-detects format
+    const origExt = path.extname(req.file.originalname).toLowerCase() || ".pdf";
+    inputPath     = req.file.path + origExt;
     fs.renameSync(req.file.path, inputPath);
 
     const outputDir = path.join(__dirname, "converted");
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-    const inputBaseName = path.parse(inputPath).name;
-    const command = `libreoffice --headless ${conv.args} "${inputPath}" --outdir "${outputDir}"`;
+    // Unique per-request user installation dir avoids profile locking across concurrent requests
+    const uid   = crypto.randomBytes(6).toString("hex");
+    loUserDir   = `/tmp/lo_${uid}`;
+    const loUrl = `file://${loUserDir}`;
 
-    exec(command, { timeout: 180000 }, (error, stdout, stderr) => {
-      // Always clean up input
+    const cmd = [
+      "libreoffice",
+      "--headless",
+      "--norestore",
+      "--nofirststartwizard",
+      `-env:UserInstallation="${loUrl}"`,
+      conv.args,
+      `"${inputPath}"`,
+      `--outdir "${outputDir}"`,
+    ].join(" ");
+
+    exec(cmd, { timeout: 180000, env: LO_ENV }, (error, stdout, stderr) => {
+      // Clean up input and temp profile
       try { fs.unlinkSync(inputPath); inputPath = null; } catch (_) {}
+      try { fs.rmSync(loUserDir, { recursive: true, force: true }); loUserDir = null; } catch (_) {}
 
-      if (error) {
+      // javaldx warning is non-fatal — only fail on real errors
+      const isRealError = error && !/javaldx/i.test(stderr);
+      if (isRealError) {
         console.error("LibreOffice error:", stderr || error.message);
-        return res.status(500).json({ error: "Conversion failed. " + (stderr || error.message).slice(0, 200) });
+        return res.status(500).json({ error: "Conversion failed: " + (stderr || error.message).slice(0, 300) });
       }
 
-      // Search output dir for the converted file — try primary ext then fallbacks
-      const tryExts = FALLBACK_EXTS[conv.targetExt] || [conv.targetExt];
+      const inputBase = path.parse(inputPath || req.file.path).name + origExt.slice(0, -origExt.length + path.parse(inputPath || req.file.path).name.length + origExt.length);
+      const baseName  = path.parse(req.file.path).name + origExt.replace(/\.[^.]+$/, "");
+
+      // Scan output dir: try all known fallback extensions first
       let convertedPath = null;
-      for (const tryExt of tryExts) {
-        const candidate = path.join(outputDir, `${inputBaseName}.${tryExt}`);
+      for (const ext of conv.fallbackExts) {
+        const candidate = path.join(outputDir, `${path.parse(req.file.path).name}${origExt.replace(/\.[^.]+$/, "")}.${ext}`);
         if (fs.existsSync(candidate)) { convertedPath = candidate; break; }
       }
 
-      // Last resort: scan output dir for any new file starting with the base name
+      // Broader scan: any file in outputDir starting with the base name
       if (!convertedPath) {
-        const files = fs.readdirSync(outputDir).filter(f => f.startsWith(inputBaseName));
-        if (files.length > 0) convertedPath = path.join(outputDir, files[0]);
+        const base = path.parse(req.file.path).name;
+        const files = fs.readdirSync(outputDir).filter(f => f.startsWith(base));
+        if (files.length > 0) {
+          files.sort((a, b) => fs.statSync(path.join(outputDir, b)).mtimeMs - fs.statSync(path.join(outputDir, a)).mtimeMs);
+          convertedPath = path.join(outputDir, files[0]);
+        }
       }
 
       if (!convertedPath) {
-        console.error("No converted file found. stdout:", stdout, "stderr:", stderr);
-        return res.status(500).json({ error: "Conversion produced no output. The file may be password-protected or unsupported." });
+        const hint = convKey.startsWith("pdf-")
+          ? "This PDF may be image-only (scanned). Try converting with online OCR tools first."
+          : "Conversion produced no output. The file may be password-protected.";
+        return res.status(500).json({ error: hint });
       }
 
       const actualExt   = path.extname(convertedPath).slice(1);
-      const originalBase = path.parse(req.file.originalname).name;
-      const downloadName = `${originalBase}.${actualExt}`;
+      const origBase    = path.parse(req.file.originalname).name;
+      const downloadName = `${origBase}.${actualExt}`;
 
       res.download(convertedPath, downloadName, (err) => {
         try { fs.unlinkSync(convertedPath); } catch (_) {}
@@ -98,9 +121,10 @@ app.post("/api/convert", upload.single("file"), (req, res) => {
   } catch (err) {
     console.error("Server error:", err);
     try { if (inputPath) fs.unlinkSync(inputPath); } catch (_) {}
+    try { if (loUserDir) fs.rmSync(loUserDir, { recursive: true, force: true }); } catch (_) {}
     if (!res.headersSent) res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`QuikConvert backend started on port ${PORT}`));
+app.listen(PORT, () => console.log(`QuikConvert backend on port ${PORT}`));
