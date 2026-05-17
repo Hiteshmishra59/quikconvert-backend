@@ -8,94 +8,97 @@ const { exec } = require("child_process");
 const app = express();
 app.use(cors());
 
-const upload = multer({ dest: "uploads/" });
+// Allow large uploads (100 MB)
+const upload = multer({
+  dest: "uploads/",
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
 
-// Map conversion type → { targetExt, libreArgs }
+// Conversion map — targetExt is what LibreOffice outputs
 const CONVERSIONS = {
   "word-pdf":  { targetExt: "pdf",  args: "--convert-to pdf" },
-  "excel-pdf": { targetExt: "pdf",  args: "--convert-to pdf" },
+  "excel-pdf": { targetExt: "pdf",  args: '--convert-to pdf:"calc_pdf_Export:PageRange=,IsSkipEmptyPages=false"' },
   "ppt-pdf":   { targetExt: "pdf",  args: "--convert-to pdf" },
-  "pdf-word":  { targetExt: "docx", args: "--infilter=\"writer_pdf_import\" --convert-to docx" },
-  "pdf-excel": { targetExt: "xlsx", args: "--infilter=\"calc_pdf_import\" --convert-to xlsx" },
-  "pdf-ppt":   { targetExt: "pptx", args: "--infilter=\"impress_pdf_import\" --convert-to pptx" },
+  "pdf-word":  { targetExt: "docx", args: '--convert-to docx:"Microsoft Word 2007-2019 XML (.docx)"' },
+  "pdf-excel": { targetExt: "xlsx", args: '--convert-to xlsx:"Calc MS Excel 2007 XML"' },
+  "pdf-ppt":   { targetExt: "pptx", args: '--convert-to pptx:"Impress MS PowerPoint 2007 XML"' },
 };
 
-app.get("/", (req, res) => res.send("QuikConvert backend running"));
+// Possible output extensions LibreOffice might produce
+const FALLBACK_EXTS = {
+  "pdf":  ["pdf"],
+  "docx": ["docx", "doc", "odt"],
+  "xlsx": ["xlsx", "xls", "ods", "csv"],
+  "pptx": ["pptx", "ppt", "odp"],
+};
+
+app.get("/", (_req, res) => res.send("QuikConvert backend running ✓"));
 
 app.post("/api/convert", upload.single("file"), (req, res) => {
   let inputPath = null;
-  let convertedPath = null;
 
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Determine conversion type from request body or auto-detect
     const type = req.body.type || "";
-    const ext = path.extname(req.file.originalname).toLowerCase();
+    const ext  = path.extname(req.file.originalname).toLowerCase();
 
-    let conversionKey = type;
-    if (!conversionKey) {
-      // Auto-detect: non-pdf → pdf, pdf → docx
-      conversionKey = ext === ".pdf" ? "pdf-word" : "word-pdf";
-    }
-
+    const conversionKey = type || (ext === ".pdf" ? "pdf-word" : "word-pdf");
     const conv = CONVERSIONS[conversionKey];
-    if (!conv) {
-      return res.status(400).json({ error: `Unknown conversion type: ${conversionKey}` });
-    }
+    if (!conv) return res.status(400).json({ error: `Unknown conversion type: ${conversionKey}` });
 
-    // Rename temp upload to include original extension (LibreOffice needs it)
+    // Rename temp file so LibreOffice can detect format from extension
     inputPath = req.file.path + ext;
     fs.renameSync(req.file.path, inputPath);
 
     const outputDir = path.join(__dirname, "converted");
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-    // LibreOffice uses the input file's basename (without ext) as output name
     const inputBaseName = path.parse(inputPath).name;
-    convertedPath = path.join(outputDir, `${inputBaseName}.${conv.targetExt}`);
-
     const command = `libreoffice --headless ${conv.args} "${inputPath}" --outdir "${outputDir}"`;
 
-    exec(command, { timeout: 120000 }, (error, stdout, stderr) => {
-      // Clean up input file
-      try { if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
+    exec(command, { timeout: 180000 }, (error, stdout, stderr) => {
+      // Always clean up input
+      try { fs.unlinkSync(inputPath); inputPath = null; } catch (_) {}
 
       if (error) {
         console.error("LibreOffice error:", stderr || error.message);
-        return res.status(500).json({ error: "Conversion failed. Make sure LibreOffice is installed." });
+        return res.status(500).json({ error: "Conversion failed. " + (stderr || error.message).slice(0, 200) });
       }
 
-      if (!fs.existsSync(convertedPath)) {
-        // LibreOffice sometimes changes the extension — scan output dir for the file
+      // Search output dir for the converted file — try primary ext then fallbacks
+      const tryExts = FALLBACK_EXTS[conv.targetExt] || [conv.targetExt];
+      let convertedPath = null;
+      for (const tryExt of tryExts) {
+        const candidate = path.join(outputDir, `${inputBaseName}.${tryExt}`);
+        if (fs.existsSync(candidate)) { convertedPath = candidate; break; }
+      }
+
+      // Last resort: scan output dir for any new file starting with the base name
+      if (!convertedPath) {
         const files = fs.readdirSync(outputDir).filter(f => f.startsWith(inputBaseName));
-        if (files.length > 0) {
-          convertedPath = path.join(outputDir, files[0]);
-        } else {
-          console.error("No converted file found in", outputDir, "| stdout:", stdout);
-          return res.status(500).json({ error: "No converted file found" });
-        }
+        if (files.length > 0) convertedPath = path.join(outputDir, files[0]);
       }
 
-      // Build a clean download filename using the original name
+      if (!convertedPath) {
+        console.error("No converted file found. stdout:", stdout, "stderr:", stderr);
+        return res.status(500).json({ error: "Conversion produced no output. The file may be password-protected or unsupported." });
+      }
+
+      const actualExt   = path.extname(convertedPath).slice(1);
       const originalBase = path.parse(req.file.originalname).name;
-      const downloadName = `${originalBase}.${conv.targetExt}`;
+      const downloadName = `${originalBase}.${actualExt}`;
 
       res.download(convertedPath, downloadName, (err) => {
-        // Clean up converted file after download
-        try { if (convertedPath && fs.existsSync(convertedPath)) fs.unlinkSync(convertedPath); } catch (_) {}
-        if (err && !res.headersSent) {
-          res.status(500).json({ error: "Download failed" });
-        }
+        try { fs.unlinkSync(convertedPath); } catch (_) {}
+        if (err && !res.headersSent) res.status(500).json({ error: "Download failed" });
       });
     });
 
   } catch (err) {
     console.error("Server error:", err);
-    try { if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
-    if (!res.headersSent) res.status(500).json({ error: "Server error" });
+    try { if (inputPath) fs.unlinkSync(inputPath); } catch (_) {}
+    if (!res.headersSent) res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
